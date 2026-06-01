@@ -22,10 +22,10 @@
 
 # Apache IoTDB
 
-Apache IoTDB (Database for Internet of Things) is an IoT native database with high performance for 
-data management and analysis, deployable on the edge and the cloud. Due to its light-weight 
-architecture, high performance and rich feature set together with its deep integration with 
-Apache Hadoop, Spark and Flink, Apache IoTDB can meet the requirements of massive data storage, 
+Apache IoTDB (Database for Internet of Things) is an IoT native database with high performance for
+data management and analysis, deployable on the edge and the cloud. Due to its light-weight
+architecture, high performance and rich feature set together with its deep integration with
+Apache Hadoop, Spark and Flink, Apache IoTDB can meet the requirements of massive data storage,
 high-speed data ingestion and complex data analysis in the IoT industrial fields.
 
 # Apache IoTDB Client for Go
@@ -34,15 +34,15 @@ high-speed data ingestion and complex data analysis in the IoT industrial fields
 [![GitHub release](https://img.shields.io/github/release/apache/iotdb-client-go.svg)](https://github.com/apache/iotdb-client-go/releases)
 [![License](https://img.shields.io/badge/license-Apache%202-4EB1BA.svg)](https://www.apache.org/licenses/LICENSE-2.0.html)
 ![](https://github-size-badge.herokuapp.com/apache/iotdb-client-go.svg)
-![](https://img.shields.io/badge/platform-win10%20%7C%20macos%20%7C%20linux-yellow.svg)
+![](https://img.shields.io/badge/platform-win%20%7C%20macos%20%7C%20linux-yellow.svg)
 [![IoTDB Website](https://img.shields.io/website-up-down-green-red/https/shields.io.svg?label=iotdb-website)](https://iotdb.apache.org/)
 
 ## Overview
 
 This is the GoLang client of Apache IoTDB.
 
-Apache IoTDB website: https://iotdb.apache.org
-Apache IoTDB Github: https://github.com/apache/iotdb
+Apache IoTDB website: <https://iotdb.apache.org>
+Apache IoTDB GitHub: <https://github.com/apache/iotdb>
 
 ## Prerequisites
 
@@ -77,6 +77,76 @@ cd $GOPATH/src/iotdb-client-go-example/session_example
 
 curl -o session_example.go -L https://github.com/apache/iotdb-client-go/raw/main/example/session_example.go
 go run session_example.go
+```
+
+## How to Use the SessionPool
+
+SessionPool is a wrapper of a Session Set. Using SessionPool, the user do not need to consider how to reuse a session connection.
+If there is no available connections and the pool reaches its max size, the all methods will hang until there is a available connection.
+The PutBack method must be called after use
+
+### New sessionPool
+
+standalone
+
+```golang
+
+config := &client.PoolConfig{
+    Host:     host,
+    Port:     port,
+    UserName: user,
+    Password: password,
+}
+sessionPool = client.NewSessionPool(config, 3, 60000, 60000, false)
+
+```
+
+cluster or doubleLive
+
+```golang
+
+config := &client.PoolConfig{
+  UserName: user,
+  Password: password,
+  NodeUrls: strings.Split("127.0.0.1:6667,127.0.0.1:6668", ","),
+ }
+sessionPool = client.NewSessionPool(config, 3, 60000, 60000, false)
+
+```
+
+### Get session through sessionPool, putback after use
+
+set storage group
+
+```golang
+
+session, err := sessionPool.GetSession()
+defer sessionPool.PutBack(session)
+if err == nil {
+    session.SetStorageGroup(sg)
+}
+
+```
+
+query statement
+
+```golang
+
+var timeout int64 = 1000
+session, err := sessionPool.GetSession()
+defer sessionPool.PutBack(session)
+if err != nil {
+    log.Print(err)
+    return
+}
+sessionDataSet, err := session.ExecuteQueryStatement(sql, &timeout)
+if err == nil {
+    defer sessionDataSet.Close()
+    printDataSet1(sessionDataSet)
+} else {
+    log.Println(err)
+}
+
 ```
 
 ## Developer environment requirements for iotdb-client-go

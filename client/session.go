@@ -21,7 +21,6 @@ package client
 
 import (
 	"bytes"
-	"container/list"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -33,14 +32,27 @@ import (
 	"strings"
 	"time"
 
-	"github.com/apache/iotdb-client-go/rpc"
 	"github.com/apache/thrift/lib/go/thrift"
+
+	"github.com/apache/iotdb-client-go/v2/common"
+	"github.com/apache/iotdb-client-go/v2/rpc"
 )
 
 const (
 	DefaultTimeZone        = "Asia/Shanghai"
 	DefaultFetchSize       = 1024
-	DefualtConnectRetryMax = 3
+	DefaultConnectRetryMax = 3
+	TreeSqlDialect         = "tree"
+	TableSqlDialect        = "table"
+)
+
+type Version string
+
+const (
+	V_0_12          = Version("V_0_12")
+	V_0_13          = Version("V_0_13")
+	V_1_0           = Version("V_1_0")
+	DEFAULT_VERSION = V_1_0
 )
 
 var errLength = errors.New("deviceIds, times, measurementsList and valuesList's size should be equal")
@@ -53,22 +65,26 @@ type Config struct {
 	FetchSize       int32
 	TimeZone        string
 	ConnectRetryMax int
+	sqlDialect      string
+	Version         Version
+	Database        string
 }
 
 type Session struct {
 	config             *Config
-	client             *rpc.TSIServiceClient
+	client             *rpc.IClientRPCServiceClient
 	sessionId          int64
 	trans              thrift.TTransport
 	requestStatementId int64
+	protocolFactory    thrift.TProtocolFactory
+	endPointList       []endPoint
+	timeFactor         int32
 }
 
 type endPoint struct {
 	Host string
 	Port string
 }
-
-var endPointList = list.New()
 
 func (s *Session) Open(enableRPCCompression bool, connectionTimeoutInMs int) error {
 	if s.config.FetchSize <= 0 {
@@ -79,21 +95,17 @@ func (s *Session) Open(enableRPCCompression bool, connectionTimeoutInMs int) err
 	}
 
 	if s.config.ConnectRetryMax <= 0 {
-		s.config.ConnectRetryMax = DefualtConnectRetryMax
+		s.config.ConnectRetryMax = DefaultConnectRetryMax
 	}
 
-	var protocolFactory thrift.TProtocolFactory
 	var err error
 
 	// in thrift 0.14.1, this func returns two values; in thrift 0.15.0, it returns one.
 	s.trans = thrift.NewTSocketConf(net.JoinHostPort(s.config.Host, s.config.Port), &thrift.TConfiguration{
 		ConnectTimeout: time.Duration(connectionTimeoutInMs) * time.Millisecond, // Use 0 for no timeout
 	})
-	if err != nil {
-		return err
-	}
 	// s.trans = thrift.NewTFramedTransport(s.trans)	// deprecated
-	var tmp_conf = thrift.TConfiguration{MaxFrameSize: thrift.DEFAULT_MAX_FRAME_SIZE}
+	tmp_conf := thrift.TConfiguration{MaxFrameSize: thrift.DEFAULT_MAX_FRAME_SIZE}
 	s.trans = thrift.NewTFramedTransportConf(s.trans, &tmp_conf)
 	if !s.trans.IsOpen() {
 		err = s.trans.Open()
@@ -101,39 +113,47 @@ func (s *Session) Open(enableRPCCompression bool, connectionTimeoutInMs int) err
 			return err
 		}
 	}
-	if enableRPCCompression {
-		protocolFactory = thrift.NewTCompactProtocolFactory()
-	} else {
-		protocolFactory = thrift.NewTBinaryProtocolFactoryDefault()
+	s.protocolFactory = getProtocolFactory(enableRPCCompression)
+	iprot := s.protocolFactory.GetProtocol(s.trans)
+	oprot := s.protocolFactory.GetProtocol(s.trans)
+	s.client = rpc.NewIClientRPCServiceClient(thrift.NewTStandardClient(iprot, oprot))
+	req := rpc.TSOpenSessionReq{
+		ClientProtocol: rpc.TSProtocolVersion_IOTDB_SERVICE_PROTOCOL_V3, ZoneId: s.config.TimeZone, Username: s.config.UserName,
+		Password: &s.config.Password,
 	}
-	iprot := protocolFactory.GetProtocol(s.trans)
-	oprot := protocolFactory.GetProtocol(s.trans)
-	s.client = rpc.NewTSIServiceClient(thrift.NewTStandardClient(iprot, oprot))
-	req := rpc.TSOpenSessionReq{ClientProtocol: rpc.TSProtocolVersion_IOTDB_SERVICE_PROTOCOL_V3, ZoneId: s.config.TimeZone, Username: &s.config.UserName,
-		Password: &s.config.Password}
+	req.Configuration = make(map[string]string)
+	req.Configuration["sql_dialect"] = s.config.sqlDialect
+	if s.config.Version == "" {
+		req.Configuration["version"] = string(DEFAULT_VERSION)
+	} else {
+		req.Configuration["version"] = string(s.config.Version)
+	}
+	if s.config.Database != "" {
+		req.Configuration["db"] = s.config.Database
+	}
 	resp, err := s.client.OpenSession(context.Background(), &req)
 	if err != nil {
 		return err
 	}
 	s.sessionId = resp.GetSessionId()
 	s.requestStatementId, err = s.client.RequestStatementId(context.Background(), s.sessionId)
+	if timeFactor, err := getTimeFactor(resp); err != nil {
+		return err
+	} else {
+		s.timeFactor = timeFactor
+	}
 	return err
 }
 
 type ClusterConfig struct {
-	NodeUrls  []string //ip:port
-	UserName  string
-	Password  string
-	FetchSize int32
-	TimeZone  string
-}
-
-type ClusterSession struct {
-	config             *ClusterConfig
-	client             *rpc.TSIServiceClient
-	sessionId          int64
-	trans              thrift.TTransport
-	requestStatementId int64
+	NodeUrls        []string //ip:port
+	UserName        string
+	Password        string
+	FetchSize       int32
+	TimeZone        string
+	ConnectRetryMax int
+	sqlDialect      string
+	Database        string
 }
 
 func (s *Session) OpenCluster(enableRPCCompression bool) error {
@@ -145,40 +165,60 @@ func (s *Session) OpenCluster(enableRPCCompression bool) error {
 	}
 
 	if s.config.ConnectRetryMax <= 0 {
-		s.config.ConnectRetryMax = DefualtConnectRetryMax
+		s.config.ConnectRetryMax = DefaultConnectRetryMax
 	}
 
-	var protocolFactory thrift.TProtocolFactory
 	var err error
 
-	if enableRPCCompression {
-		protocolFactory = thrift.NewTCompactProtocolFactory()
-	} else {
-		protocolFactory = thrift.NewTBinaryProtocolFactoryDefault()
+	s.protocolFactory = getProtocolFactory(enableRPCCompression)
+	iprot := s.protocolFactory.GetProtocol(s.trans)
+	oprot := s.protocolFactory.GetProtocol(s.trans)
+	s.client = rpc.NewIClientRPCServiceClient(thrift.NewTStandardClient(iprot, oprot))
+	req := rpc.TSOpenSessionReq{
+		ClientProtocol: rpc.TSProtocolVersion_IOTDB_SERVICE_PROTOCOL_V3, ZoneId: s.config.TimeZone, Username: s.config.UserName,
+		Password: &s.config.Password,
 	}
-	iprot := protocolFactory.GetProtocol(s.trans)
-	oprot := protocolFactory.GetProtocol(s.trans)
-	s.client = rpc.NewTSIServiceClient(thrift.NewTStandardClient(iprot, oprot))
-	req := rpc.TSOpenSessionReq{ClientProtocol: rpc.TSProtocolVersion_IOTDB_SERVICE_PROTOCOL_V3, ZoneId: s.config.TimeZone, Username: &s.config.UserName,
-		Password: &s.config.Password}
+	req.Configuration = make(map[string]string)
+	req.Configuration["sql_dialect"] = s.config.sqlDialect
+	if s.config.Version == "" {
+		req.Configuration["version"] = string(DEFAULT_VERSION)
+	} else {
+		req.Configuration["version"] = string(s.config.Version)
+	}
+	if s.config.Database != "" {
+		req.Configuration["db"] = s.config.Database
+	}
 
 	resp, err := s.client.OpenSession(context.Background(), &req)
 	if err != nil {
 		return err
+	}
+	if timeFactor, err := getTimeFactor(resp); err != nil {
+		return err
+	} else {
+		s.timeFactor = timeFactor
 	}
 	s.sessionId = resp.GetSessionId()
 	s.requestStatementId, err = s.client.RequestStatementId(context.Background(), s.sessionId)
 	return err
 }
 
-func (s *Session) Close() (r *rpc.TSStatus, err error) {
+func getProtocolFactory(enableRPCCompression bool) thrift.TProtocolFactory {
+	if enableRPCCompression {
+		return thrift.NewTCompactProtocolFactoryConf(&thrift.TConfiguration{})
+	} else {
+		return thrift.NewTBinaryProtocolFactoryConf(&thrift.TConfiguration{})
+	}
+}
+
+func (s *Session) Close() error {
 	req := rpc.NewTSCloseSessionReq()
 	req.SessionId = s.sessionId
-	_, err = s.client.CloseSession(context.Background(), req)
+	_, err := s.client.CloseSession(context.Background(), req)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return nil, s.trans.Close()
+	return s.trans.Close()
 }
 
 /*
@@ -188,14 +228,17 @@ func (s *Session) Close() (r *rpc.TSStatus, err error) {
  *return
  *error: correctness of operation
  */
-func (s *Session) SetStorageGroup(storageGroupId string) (r *rpc.TSStatus, err error) {
-	r, err = s.client.SetStorageGroup(context.Background(), s.sessionId, storageGroupId)
+func (s *Session) SetStorageGroup(storageGroupId string) error {
+	r, err := s.client.SetStorageGroup(context.Background(), s.sessionId, storageGroupId)
 	if err != nil && r == nil {
 		if s.reconnect() {
 			r, err = s.client.SetStorageGroup(context.Background(), s.sessionId, storageGroupId)
 		}
 	}
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
 /*
@@ -205,14 +248,17 @@ func (s *Session) SetStorageGroup(storageGroupId string) (r *rpc.TSStatus, err e
  *return
  *error: correctness of operation
  */
-func (s *Session) DeleteStorageGroup(storageGroupId string) (r *rpc.TSStatus, err error) {
-	r, err = s.client.DeleteStorageGroups(context.Background(), s.sessionId, []string{storageGroupId})
+func (s *Session) DeleteStorageGroup(storageGroupId string) error {
+	r, err := s.client.DeleteStorageGroups(context.Background(), s.sessionId, []string{storageGroupId})
 	if err != nil && r == nil {
 		if s.reconnect() {
 			r, err = s.client.DeleteStorageGroups(context.Background(), s.sessionId, []string{storageGroupId})
 		}
 	}
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
 /*
@@ -222,14 +268,17 @@ func (s *Session) DeleteStorageGroup(storageGroupId string) (r *rpc.TSStatus, er
  *return
  *error: correctness of operation
  */
-func (s *Session) DeleteStorageGroups(storageGroupIds ...string) (r *rpc.TSStatus, err error) {
-	r, err = s.client.DeleteStorageGroups(context.Background(), s.sessionId, storageGroupIds)
+func (s *Session) DeleteStorageGroups(storageGroupIds ...string) error {
+	r, err := s.client.DeleteStorageGroups(context.Background(), s.sessionId, storageGroupIds)
 	if err != nil && r == nil {
 		if s.reconnect() {
 			r, err = s.client.DeleteStorageGroups(context.Background(), s.sessionId, storageGroupIds)
 		}
 	}
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
 /*
@@ -242,9 +291,11 @@ func (s *Session) DeleteStorageGroups(storageGroupIds ...string) (r *rpc.TSStatu
  *return
  *error: correctness of operation
  */
-func (s *Session) CreateTimeseries(path string, dataType TSDataType, encoding TSEncoding, compressor TSCompressionType, attributes map[string]string, tags map[string]string) (r *rpc.TSStatus, err error) {
-	request := rpc.TSCreateTimeseriesReq{SessionId: s.sessionId, Path: path, DataType: int32(dataType), Encoding: int32(encoding),
-		Compressor: int32(compressor), Attributes: attributes, Tags: tags}
+func (s *Session) CreateTimeseries(path string, dataType TSDataType, encoding TSEncoding, compressor TSCompressionType, attributes map[string]string, tags map[string]string) error {
+	request := rpc.TSCreateTimeseriesReq{
+		SessionId: s.sessionId, Path: path, DataType: int32(dataType), Encoding: int32(encoding),
+		Compressor: int32(compressor), Attributes: attributes, Tags: tags,
+	}
 	status, err := s.client.CreateTimeseries(context.Background(), &request)
 	if err != nil && status == nil {
 		if s.reconnect() {
@@ -252,7 +303,10 @@ func (s *Session) CreateTimeseries(path string, dataType TSDataType, encoding TS
 			status, err = s.client.CreateTimeseries(context.Background(), &request)
 		}
 	}
-	return status, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(status)
 }
 
 /*
@@ -267,7 +321,7 @@ func (s *Session) CreateTimeseries(path string, dataType TSDataType, encoding TS
  *return
  *error: correctness of operation
  */
-func (s *Session) CreateAlignedTimeseries(prefixPath string, measurements []string, dataTypes []TSDataType, encodings []TSEncoding, compressors []TSCompressionType, measurementAlias []string) (r *rpc.TSStatus, err error) {
+func (s *Session) CreateAlignedTimeseries(prefixPath string, measurements []string, dataTypes []TSDataType, encodings []TSEncoding, compressors []TSCompressionType, measurementAlias []string) error {
 	destTypes := make([]int32, len(dataTypes))
 	for i, t := range dataTypes {
 		destTypes[i] = int32(t)
@@ -299,7 +353,10 @@ func (s *Session) CreateAlignedTimeseries(prefixPath string, measurements []stri
 			status, err = s.client.CreateAlignedTimeseries(context.Background(), &request)
 		}
 	}
-	return status, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(status)
 }
 
 /*
@@ -312,7 +369,7 @@ func (s *Session) CreateAlignedTimeseries(prefixPath string, measurements []stri
  *return
  *error: correctness of operation
  */
-func (s *Session) CreateMultiTimeseries(paths []string, dataTypes []TSDataType, encodings []TSEncoding, compressors []TSCompressionType) (r *rpc.TSStatus, err error) {
+func (s *Session) CreateMultiTimeseries(paths []string, dataTypes []TSDataType, encodings []TSEncoding, compressors []TSCompressionType) error {
 	destTypes := make([]int32, len(dataTypes))
 	for i, t := range dataTypes {
 		destTypes[i] = int32(t)
@@ -328,9 +385,11 @@ func (s *Session) CreateMultiTimeseries(paths []string, dataTypes []TSDataType, 
 		destCompressions[i] = int32(e)
 	}
 
-	request := rpc.TSCreateMultiTimeseriesReq{SessionId: s.sessionId, Paths: paths, DataTypes: destTypes,
-		Encodings: destEncodings, Compressors: destCompressions}
-	r, err = s.client.CreateMultiTimeseries(context.Background(), &request)
+	request := rpc.TSCreateMultiTimeseriesReq{
+		SessionId: s.sessionId, Paths: paths, DataTypes: destTypes,
+		Encodings: destEncodings, Compressors: destCompressions,
+	}
+	r, err := s.client.CreateMultiTimeseries(context.Background(), &request)
 
 	if err != nil && r == nil {
 		if s.reconnect() {
@@ -339,7 +398,10 @@ func (s *Session) CreateMultiTimeseries(paths []string, dataTypes []TSDataType, 
 		}
 	}
 
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
 /*
@@ -349,14 +411,17 @@ func (s *Session) CreateMultiTimeseries(paths []string, dataTypes []TSDataType, 
  *return
  *error: correctness of operation
  */
-func (s *Session) DeleteTimeseries(paths []string) (r *rpc.TSStatus, err error) {
-	r, err = s.client.DeleteTimeseries(context.Background(), s.sessionId, paths)
+func (s *Session) DeleteTimeseries(paths []string) error {
+	r, err := s.client.DeleteTimeseries(context.Background(), s.sessionId, paths)
 	if err != nil && r == nil {
 		if s.reconnect() {
 			r, err = s.client.DeleteTimeseries(context.Background(), s.sessionId, paths)
 		}
 	}
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
 /*
@@ -368,16 +433,19 @@ func (s *Session) DeleteTimeseries(paths []string) (r *rpc.TSStatus, err error) 
  *return
  *error: correctness of operation
  */
-func (s *Session) DeleteData(paths []string, startTime int64, endTime int64) (r *rpc.TSStatus, err error) {
+func (s *Session) DeleteData(paths []string, startTime int64, endTime int64) error {
 	request := rpc.TSDeleteDataReq{SessionId: s.sessionId, Paths: paths, StartTime: startTime, EndTime: endTime}
-	r, err = s.client.DeleteData(context.Background(), &request)
+	r, err := s.client.DeleteData(context.Background(), &request)
 	if err != nil && r == nil {
 		if s.reconnect() {
 			request.SessionId = s.sessionId
 			r, err = s.client.DeleteData(context.Background(), &request)
 		}
 	}
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
 /*
@@ -390,89 +458,225 @@ func (s *Session) DeleteData(paths []string, startTime int64, endTime int64) (r 
  *return
  *error: correctness of operation
  */
-func (s *Session) InsertStringRecord(deviceId string, measurements []string, values []string, timestamp int64) (r *rpc.TSStatus, err error) {
-	request := rpc.TSInsertStringRecordReq{SessionId: s.sessionId, PrefixPath: deviceId, Measurements: measurements,
-		Values: values, Timestamp: timestamp}
-	r, err = s.client.InsertStringRecord(context.Background(), &request)
+func (s *Session) InsertStringRecord(deviceId string, measurements []string, values []string, timestamp int64) error {
+	request := rpc.TSInsertStringRecordReq{
+		SessionId: s.sessionId, PrefixPath: deviceId, Measurements: measurements,
+		Values: values, Timestamp: timestamp,
+	}
+	r, err := s.client.InsertStringRecord(context.Background(), &request)
 	if err != nil && r == nil {
 		if s.reconnect() {
 			request.SessionId = s.sessionId
 			r, err = s.client.InsertStringRecord(context.Background(), &request)
 		}
 	}
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
 func (s *Session) GetTimeZone() (string, error) {
 	resp, err := s.client.GetTimeZone(context.Background(), s.sessionId)
 	if err != nil {
-		return "", err
+		return DefaultTimeZone, err
 	}
 	return resp.TimeZone, nil
 }
 
-func (s *Session) SetTimeZone(timeZone string) (r *rpc.TSStatus, err error) {
+func (s *Session) SetTimeZone(timeZone string) error {
 	request := rpc.TSSetTimeZoneReq{SessionId: s.sessionId, TimeZone: timeZone}
-	r, err = s.client.SetTimeZone(context.Background(), &request)
+	r, err := s.client.SetTimeZone(context.Background(), &request)
+	if err != nil {
+		return err
+	}
+	if err := VerifySuccess(r); err != nil {
+		return err
+	}
 	s.config.TimeZone = timeZone
-	return r, err
+	return nil
+}
+
+func (s *Session) ExecuteStatementWithContext(ctx context.Context, sql string) (*SessionDataSet, error) {
+	request := rpc.TSExecuteStatementReq{
+		SessionId:   s.sessionId,
+		Statement:   sql,
+		StatementId: s.requestStatementId,
+		FetchSize:   &s.config.FetchSize,
+	}
+	resp, err := s.client.ExecuteStatementV2(ctx, &request)
+
+	if err != nil && resp == nil {
+		if s.reconnect() {
+			request.SessionId = s.sessionId
+			request.StatementId = s.requestStatementId
+			resp, err = s.client.ExecuteStatementV2(ctx, &request)
+		}
+	}
+	if statusErr := VerifySuccess(resp.Status); statusErr != nil {
+		return nil, statusErr
+	}
+
+	return s.genDataSet(sql, resp)
 }
 
 func (s *Session) ExecuteStatement(sql string) (*SessionDataSet, error) {
-	request := rpc.TSExecuteStatementReq{
-		SessionId:   s.sessionId,
-		Statement:   sql,
-		StatementId: s.requestStatementId,
-		FetchSize:   &s.config.FetchSize,
-	}
-	resp, err := s.client.ExecuteStatement(context.Background(), &request)
-
-	if err != nil && resp == nil {
-		if s.reconnect() {
-			request.SessionId = s.sessionId
-			resp, err = s.client.ExecuteStatement(context.Background(), &request)
-		}
-	}
-
-	return s.genDataSet(sql, resp), err
+	return s.ExecuteStatementWithContext(context.Background(), sql)
 }
 
-func (s *Session) ExecuteNonQueryStatement(sql string) (r *rpc.TSStatus, err error) {
+func (s *Session) ExecuteNonQueryStatement(sql string) error {
 	request := rpc.TSExecuteStatementReq{
 		SessionId:   s.sessionId,
 		Statement:   sql,
 		StatementId: s.requestStatementId,
 		FetchSize:   &s.config.FetchSize,
 	}
-	resp, err := s.client.ExecuteStatement(context.Background(), &request)
+	resp, err := s.client.ExecuteStatementV2(context.Background(), &request)
 
 	if err != nil && resp == nil {
 		if s.reconnect() {
 			request.SessionId = s.sessionId
-			resp, err = s.client.ExecuteStatement(context.Background(), &request)
+			request.StatementId = s.requestStatementId
+			resp, err = s.client.ExecuteStatementV2(context.Background(), &request)
 		}
 	}
+	if err != nil {
+		return err
+	}
+	if resp.IsSetDatabase() {
+		s.changeDatabase(*resp.Database)
+	}
+	return VerifySuccess(resp.Status)
+}
 
-	return resp.Status, err
+func (s *Session) changeDatabase(database string) {
+	s.config.Database = database
 }
 
 func (s *Session) ExecuteQueryStatement(sql string, timeoutMs *int64) (*SessionDataSet, error) {
-	request := rpc.TSExecuteStatementReq{SessionId: s.sessionId, Statement: sql, StatementId: s.requestStatementId,
-		FetchSize: &s.config.FetchSize, Timeout: timeoutMs}
-	if resp, err := s.client.ExecuteQueryStatement(context.Background(), &request); err == nil {
+	request := rpc.TSExecuteStatementReq{
+		SessionId: s.sessionId, Statement: sql, StatementId: s.requestStatementId,
+		FetchSize: &s.config.FetchSize, Timeout: timeoutMs,
+	}
+	if resp, err := s.client.ExecuteQueryStatementV2(context.Background(), &request); err == nil {
 		if statusErr := VerifySuccess(resp.Status); statusErr == nil {
-			return NewSessionDataSet(sql, resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.client, s.sessionId, resp.QueryDataSet, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, s.config.FetchSize, timeoutMs), err
+			return NewSessionDataSet(sql, resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.requestStatementId, s.client, s.sessionId, resp.QueryResult_, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, timeoutMs, *resp.MoreData, s.config.FetchSize, s.config.TimeZone, s.timeFactor, resp.ColumnIndex2TsBlockColumnIndexList)
 		} else {
 			return nil, statusErr
 		}
 	} else {
 		if s.reconnect() {
 			request.SessionId = s.sessionId
-			resp, err = s.client.ExecuteQueryStatement(context.Background(), &request)
-			if statusErr := VerifySuccess(resp.Status); statusErr == nil {
-				return NewSessionDataSet(sql, resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.client, s.sessionId, resp.QueryDataSet, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, s.config.FetchSize, timeoutMs), err
-			} else {
-				return nil, statusErr
+			request.StatementId = s.requestStatementId
+			resp, err = s.client.ExecuteQueryStatementV2(context.Background(), &request)
+			if err == nil {
+				if resp == nil {
+					return nil, fmt.Errorf("received nil response after reconnect")
+				}
+				if statusErr := VerifySuccess(resp.Status); statusErr == nil {
+					return NewSessionDataSet(sql, resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.requestStatementId, s.client, s.sessionId, resp.QueryResult_, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, timeoutMs, *resp.MoreData, s.config.FetchSize, s.config.TimeZone, s.timeFactor, resp.GetColumnIndex2TsBlockColumnIndexList())
+				} else {
+					return nil, statusErr
+				}
+			}
+		}
+		return nil, err
+	}
+}
+
+func (s *Session) ExecuteAggregationQuery(paths []string, aggregations []common.TAggregationType,
+	startTime *int64, endTime *int64, interval *int64,
+	timeoutMs *int64,
+) (*SessionDataSet, error) {
+	request := rpc.TSAggregationQueryReq{
+		SessionId: s.sessionId, StatementId: s.requestStatementId, Paths: paths,
+		Aggregations: aggregations, StartTime: startTime, EndTime: endTime, Interval: interval, FetchSize: &s.config.FetchSize, Timeout: timeoutMs,
+	}
+	if resp, err := s.client.ExecuteAggregationQueryV2(context.Background(), &request); err == nil {
+		if statusErr := VerifySuccess(resp.Status); statusErr == nil {
+			return NewSessionDataSet("", resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.requestStatementId, s.client, s.sessionId, resp.QueryResult_, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, timeoutMs, *resp.MoreData, s.config.FetchSize, s.config.TimeZone, s.timeFactor, resp.GetColumnIndex2TsBlockColumnIndexList())
+		} else {
+			return nil, statusErr
+		}
+	} else {
+		if s.reconnect() {
+			request.SessionId = s.sessionId
+			resp, err = s.client.ExecuteAggregationQueryV2(context.Background(), &request)
+			if err == nil {
+				if resp == nil {
+					return nil, fmt.Errorf("received nil response after reconnect")
+				}
+				if statusErr := VerifySuccess(resp.Status); statusErr == nil {
+					return NewSessionDataSet("", resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.requestStatementId, s.client, s.sessionId, resp.QueryResult_, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, timeoutMs, *resp.MoreData, s.config.FetchSize, s.config.TimeZone, s.timeFactor, resp.GetColumnIndex2TsBlockColumnIndexList())
+				} else {
+					return nil, statusErr
+				}
+			}
+		}
+		return nil, err
+	}
+}
+
+func (s *Session) ExecuteAggregationQueryWithLegalNodes(paths []string, aggregations []common.TAggregationType,
+	startTime *int64, endTime *int64, interval *int64,
+	timeoutMs *int64, legalNodes *bool,
+) (*SessionDataSet, error) {
+	request := rpc.TSAggregationQueryReq{
+		SessionId: s.sessionId, StatementId: s.requestStatementId, Paths: paths,
+		Aggregations: aggregations, StartTime: startTime, EndTime: endTime, Interval: interval, FetchSize: &s.config.FetchSize,
+		Timeout: timeoutMs, LegalPathNodes: legalNodes,
+	}
+	if resp, err := s.client.ExecuteAggregationQueryV2(context.Background(), &request); err == nil {
+		if statusErr := VerifySuccess(resp.Status); statusErr == nil {
+			return NewSessionDataSet("", resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.requestStatementId, s.client, s.sessionId, resp.QueryResult_, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, timeoutMs, *resp.MoreData, s.config.FetchSize, s.config.TimeZone, s.timeFactor, resp.GetColumnIndex2TsBlockColumnIndexList())
+		} else {
+			return nil, statusErr
+		}
+	} else {
+		if s.reconnect() {
+			request.SessionId = s.sessionId
+			resp, err = s.client.ExecuteAggregationQueryV2(context.Background(), &request)
+			if err == nil {
+				if resp == nil {
+					return nil, fmt.Errorf("received nil response after reconnect")
+				}
+				if statusErr := VerifySuccess(resp.Status); statusErr == nil {
+					return NewSessionDataSet("", resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.requestStatementId, s.client, s.sessionId, resp.QueryResult_, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, timeoutMs, *resp.MoreData, s.config.FetchSize, s.config.TimeZone, s.timeFactor, resp.GetColumnIndex2TsBlockColumnIndexList())
+				} else {
+					return nil, statusErr
+				}
+			}
+		}
+		return nil, err
+	}
+}
+
+func (s *Session) ExecuteFastLastDataQueryForOnePrefixPath(prefixes []string, timeoutMs *int64) (*SessionDataSet, error) {
+	request := rpc.TSFastLastDataQueryForOnePrefixPathReq{
+		SessionId:   s.sessionId,
+		StatementId: s.requestStatementId,
+		Prefixes:    prefixes,
+		Timeout:     timeoutMs,
+	}
+	if resp, err := s.client.ExecuteFastLastDataQueryForOnePrefixPath(context.Background(), &request); err == nil {
+		if statusErr := VerifySuccess(resp.Status); statusErr == nil {
+			return NewSessionDataSet("", resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.requestStatementId, s.client, s.sessionId, resp.QueryResult_, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, timeoutMs, *resp.MoreData, s.config.FetchSize, s.config.TimeZone, s.timeFactor, resp.GetColumnIndex2TsBlockColumnIndexList())
+		} else {
+			return nil, statusErr
+		}
+	} else {
+		if s.reconnect() {
+			request.SessionId = s.sessionId
+			resp, err = s.client.ExecuteFastLastDataQueryForOnePrefixPath(context.Background(), &request)
+			if err == nil {
+				if resp == nil {
+					return nil, fmt.Errorf("received nil response after reconnect")
+				}
+				if statusErr := VerifySuccess(resp.Status); statusErr == nil {
+					return NewSessionDataSet("", resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.requestStatementId, s.client, s.sessionId, resp.QueryResult_, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, timeoutMs, *resp.MoreData, s.config.FetchSize, s.config.TimeZone, s.timeFactor, resp.GetColumnIndex2TsBlockColumnIndexList())
+				} else {
+					return nil, statusErr
+				}
 			}
 		}
 		return nil, err
@@ -483,14 +687,15 @@ func (s *Session) genTSInsertRecordReq(deviceId string, time int64,
 	measurements []string,
 	types []TSDataType,
 	values []interface{},
-	isAligned bool) (*rpc.TSInsertRecordReq, error) {
+	isAligned bool,
+) (*rpc.TSInsertRecordReq, error) {
 	request := &rpc.TSInsertRecordReq{}
 	request.SessionId = s.sessionId
 	request.PrefixPath = deviceId
 	request.Timestamp = time
 	request.Measurements = measurements
 	request.IsAligned = &isAligned
-	if bys, err := valuesToBytes(types, values); err == nil {
+	if bys, err := valuesToBytes(types, values, measurements); err == nil {
 		request.Values = bys
 	} else {
 		return nil, err
@@ -498,12 +703,12 @@ func (s *Session) genTSInsertRecordReq(deviceId string, time int64,
 	return request, nil
 }
 
-func (s *Session) InsertRecord(deviceId string, measurements []string, dataTypes []TSDataType, values []interface{}, timestamp int64) (r *rpc.TSStatus, err error) {
+func (s *Session) InsertRecord(deviceId string, measurements []string, dataTypes []TSDataType, values []interface{}, timestamp int64) error {
 	request, err := s.genTSInsertRecordReq(deviceId, timestamp, measurements, dataTypes, values, false)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	r, err = s.client.InsertRecord(context.Background(), request)
+	r, err := s.client.InsertRecord(context.Background(), request)
 
 	if err != nil && r == nil {
 		if s.reconnect() {
@@ -512,15 +717,18 @@ func (s *Session) InsertRecord(deviceId string, measurements []string, dataTypes
 		}
 	}
 
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
-func (s *Session) InsertAlignedRecord(deviceId string, measurements []string, dataTypes []TSDataType, values []interface{}, timestamp int64) (r *rpc.TSStatus, err error) {
+func (s *Session) InsertAlignedRecord(deviceId string, measurements []string, dataTypes []TSDataType, values []interface{}, timestamp int64) error {
 	request, err := s.genTSInsertRecordReq(deviceId, timestamp, measurements, dataTypes, values, true)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	r, err = s.client.InsertRecord(context.Background(), request)
+	r, err := s.client.InsertRecord(context.Background(), request)
 
 	if err != nil && r == nil {
 		if s.reconnect() {
@@ -529,7 +737,10 @@ func (s *Session) InsertAlignedRecord(deviceId string, measurements []string, da
 		}
 	}
 
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
 type deviceData struct {
@@ -558,11 +769,11 @@ func (d *deviceData) Swap(i, j int) {
 // InsertRecordsOfOneDevice Insert multiple rows, which can reduce the overhead of network. This method is just like jdbc
 // executeBatch, we pack some insert request in batch and send them to server. If you want improve
 // your performance, please see insertTablet method
-// Each row is independent, which could have different deviceId, time, number of measurements
-func (s *Session) InsertRecordsOfOneDevice(deviceId string, timestamps []int64, measurementsSlice [][]string, dataTypesSlice [][]TSDataType, valuesSlice [][]interface{}, sorted bool) (r *rpc.TSStatus, err error) {
+// Each row is independent, which could have different insertTargetName, time, number of measurements
+func (s *Session) InsertRecordsOfOneDevice(deviceId string, timestamps []int64, measurementsSlice [][]string, dataTypesSlice [][]TSDataType, valuesSlice [][]interface{}, sorted bool) error {
 	length := len(timestamps)
 	if len(measurementsSlice) != length || len(dataTypesSlice) != length || len(valuesSlice) != length {
-		return nil, errors.New("timestamps, measurementsSlice and valuesSlice's size should be equal")
+		return errors.New("timestamps, measurementsSlice and valuesSlice's size should be equal")
 	}
 
 	if !sorted {
@@ -574,10 +785,11 @@ func (s *Session) InsertRecordsOfOneDevice(deviceId string, timestamps []int64, 
 		})
 	}
 
+	var err error
 	valuesList := make([][]byte, length)
 	for i := 0; i < length; i++ {
-		if valuesList[i], err = valuesToBytes(dataTypesSlice[i], valuesSlice[i]); err != nil {
-			return nil, err
+		if valuesList[i], err = valuesToBytes(dataTypesSlice[i], valuesSlice[i], measurementsSlice[i]); err != nil {
+			return err
 		}
 	}
 
@@ -589,7 +801,7 @@ func (s *Session) InsertRecordsOfOneDevice(deviceId string, timestamps []int64, 
 		ValuesList:       valuesList,
 	}
 
-	r, err = s.client.InsertRecordsOfOneDevice(context.Background(), request)
+	r, err := s.client.InsertRecordsOfOneDevice(context.Background(), request)
 
 	if err != nil && r == nil {
 		if s.reconnect() {
@@ -598,13 +810,16 @@ func (s *Session) InsertRecordsOfOneDevice(deviceId string, timestamps []int64, 
 		}
 	}
 
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
-func (s *Session) InsertAlignedRecordsOfOneDevice(deviceId string, timestamps []int64, measurementsSlice [][]string, dataTypesSlice [][]TSDataType, valuesSlice [][]interface{}, sorted bool) (r *rpc.TSStatus, err error) {
+func (s *Session) InsertAlignedRecordsOfOneDevice(deviceId string, timestamps []int64, measurementsSlice [][]string, dataTypesSlice [][]TSDataType, valuesSlice [][]interface{}, sorted bool) error {
 	length := len(timestamps)
 	if len(measurementsSlice) != length || len(dataTypesSlice) != length || len(valuesSlice) != length {
-		return nil, errors.New("timestamps, measurementsSlice and valuesSlice's size should be equal")
+		return errors.New("timestamps, measurementsSlice and valuesSlice's size should be equal")
 	}
 
 	if !sorted {
@@ -616,13 +831,14 @@ func (s *Session) InsertAlignedRecordsOfOneDevice(deviceId string, timestamps []
 		})
 	}
 
+	var err error
 	valuesList := make([][]byte, length)
 	for i := 0; i < length; i++ {
-		if valuesList[i], err = valuesToBytes(dataTypesSlice[i], valuesSlice[i]); err != nil {
-			return nil, err
+		if valuesList[i], err = valuesToBytes(dataTypesSlice[i], valuesSlice[i], measurementsSlice[i]); err != nil {
+			return err
 		}
 	}
-	var isAligned = true
+	isAligned := true
 	request := &rpc.TSInsertRecordsOfOneDeviceReq{
 		SessionId:        s.sessionId,
 		PrefixPath:       deviceId,
@@ -632,7 +848,7 @@ func (s *Session) InsertAlignedRecordsOfOneDevice(deviceId string, timestamps []
 		IsAligned:        &isAligned,
 	}
 
-	r, err = s.client.InsertRecordsOfOneDevice(context.Background(), request)
+	r, err := s.client.InsertRecordsOfOneDevice(context.Background(), request)
 
 	if err != nil && r == nil {
 		if s.reconnect() {
@@ -641,7 +857,10 @@ func (s *Session) InsertAlignedRecordsOfOneDevice(deviceId string, timestamps []
 		}
 	}
 
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
 /*
@@ -657,36 +876,44 @@ func (s *Session) InsertAlignedRecordsOfOneDevice(deviceId string, timestamps []
  *
  */
 func (s *Session) InsertRecords(deviceIds []string, measurements [][]string, dataTypes [][]TSDataType, values [][]interface{},
-	timestamps []int64) (r *rpc.TSStatus, err error) {
+	timestamps []int64,
+) error {
 	request, err := s.genInsertRecordsReq(deviceIds, measurements, dataTypes, values, timestamps, false)
 	if err != nil {
-		return nil, err
+		return err
 	} else {
-		r, err = s.client.InsertRecords(context.Background(), request)
+		r, err := s.client.InsertRecords(context.Background(), request)
 		if err != nil && r == nil {
 			if s.reconnect() {
 				request.SessionId = s.sessionId
 				r, err = s.client.InsertRecords(context.Background(), request)
 			}
 		}
-		return r, err
+		if err != nil {
+			return err
+		}
+		return VerifySuccess(r)
 	}
 }
 
 func (s *Session) InsertAlignedRecords(deviceIds []string, measurements [][]string, dataTypes [][]TSDataType, values [][]interface{},
-	timestamps []int64) (r *rpc.TSStatus, err error) {
+	timestamps []int64,
+) error {
 	request, err := s.genInsertRecordsReq(deviceIds, measurements, dataTypes, values, timestamps, true)
 	if err != nil {
-		return nil, err
+		return err
 	} else {
-		r, err = s.client.InsertRecords(context.Background(), request)
+		r, err := s.client.InsertRecords(context.Background(), request)
 		if err != nil && r == nil {
 			if s.reconnect() {
 				request.SessionId = s.sessionId
 				r, err = s.client.InsertRecords(context.Background(), request)
 			}
 		}
-		return r, err
+		if err != nil {
+			return err
+		}
+		return VerifySuccess(r)
 	}
 }
 
@@ -695,63 +922,72 @@ func (s *Session) InsertAlignedRecords(deviceIds []string, measurements [][]stri
  *params
  *tablets: []*client.Tablet, list of tablets
  */
-func (s *Session) InsertTablets(tablets []*Tablet, sorted bool) (r *rpc.TSStatus, err error) {
+func (s *Session) InsertTablets(tablets []*Tablet, sorted bool) error {
 	if !sorted {
 		for _, t := range tablets {
 			if err := t.Sort(); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
 	request, err := s.genInsertTabletsReq(tablets, false)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	r, err = s.client.InsertTablets(context.Background(), request)
+	r, err := s.client.InsertTablets(context.Background(), request)
 	if err != nil && r == nil {
 		if s.reconnect() {
 			request.SessionId = s.sessionId
 			r, err = s.client.InsertTablets(context.Background(), request)
 		}
 	}
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
-func (s *Session) InsertAlignedTablets(tablets []*Tablet, sorted bool) (r *rpc.TSStatus, err error) {
+func (s *Session) InsertAlignedTablets(tablets []*Tablet, sorted bool) error {
 	if !sorted {
 		for _, t := range tablets {
 			if err := t.Sort(); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
 	request, err := s.genInsertTabletsReq(tablets, true)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	r, err = s.client.InsertTablets(context.Background(), request)
+	r, err := s.client.InsertTablets(context.Background(), request)
 	if err != nil && r == nil {
 		if s.reconnect() {
 			request.SessionId = s.sessionId
 			r, err = s.client.InsertTablets(context.Background(), request)
 		}
 	}
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
-func (s *Session) ExecuteBatchStatement(inserts []string) (r *rpc.TSStatus, err error) {
+func (s *Session) ExecuteBatchStatement(inserts []string) error {
 	request := rpc.TSExecuteBatchStatementReq{
 		SessionId:  s.sessionId,
 		Statements: inserts,
 	}
-	r, err = s.client.ExecuteBatchStatement(context.Background(), &request)
+	r, err := s.client.ExecuteBatchStatement(context.Background(), &request)
 	if err != nil && r == nil {
 		if s.reconnect() {
 			request.SessionId = s.sessionId
 			r, err = s.client.ExecuteBatchStatement(context.Background(), &request)
 		}
 	}
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
 func (s *Session) ExecuteRawDataQuery(paths []string, startTime int64, endTime int64) (*SessionDataSet, error) {
@@ -763,16 +999,17 @@ func (s *Session) ExecuteRawDataQuery(paths []string, startTime int64, endTime i
 		EndTime:     endTime,
 		StatementId: s.requestStatementId,
 	}
-	resp, err := s.client.ExecuteRawDataQuery(context.Background(), &request)
+	resp, err := s.client.ExecuteRawDataQueryV2(context.Background(), &request)
 
 	if err != nil && resp == nil {
 		if s.reconnect() {
 			request.SessionId = s.sessionId
-			resp, err = s.client.ExecuteRawDataQuery(context.Background(), &request)
+			request.StatementId = s.requestStatementId
+			resp, err = s.client.ExecuteRawDataQueryV2(context.Background(), &request)
 		}
 	}
 
-	return s.genDataSet("", resp), err
+	return s.genDataSet("", resp)
 }
 
 func (s *Session) ExecuteUpdateStatement(sql string) (*SessionDataSet, error) {
@@ -782,20 +1019,32 @@ func (s *Session) ExecuteUpdateStatement(sql string) (*SessionDataSet, error) {
 		StatementId: s.requestStatementId,
 		FetchSize:   &s.config.FetchSize,
 	}
-	resp, err := s.client.ExecuteUpdateStatement(context.Background(), &request)
+	resp, err := s.client.ExecuteUpdateStatementV2(context.Background(), &request)
 
 	if err != nil && resp == nil {
 		if s.reconnect() {
 			request.SessionId = s.sessionId
-			resp, err = s.client.ExecuteUpdateStatement(context.Background(), &request)
+			request.StatementId = s.requestStatementId
+			resp, err = s.client.ExecuteUpdateStatementV2(context.Background(), &request)
 		}
 	}
 
-	return s.genDataSet(sql, resp), err
+	return s.genDataSet(sql, resp)
 }
 
-func (s *Session) genDataSet(sql string, resp *rpc.TSExecuteStatementResp) *SessionDataSet {
-	return NewSessionDataSet(sql, resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap, *resp.QueryId, s.client, s.sessionId, resp.QueryDataSet, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, s.config.FetchSize, nil)
+func (s *Session) genDataSet(sql string, resp *rpc.TSExecuteStatementResp) (*SessionDataSet, error) {
+	var queryId int64
+	if resp.QueryId == nil {
+		queryId = 0
+	} else {
+		queryId = *resp.QueryId
+	}
+	moreData := false
+	if resp.MoreData != nil {
+		moreData = *resp.MoreData
+	}
+	return NewSessionDataSet(sql, resp.Columns, resp.DataTypeList, resp.ColumnNameIndexMap,
+		queryId, s.requestStatementId, s.client, s.sessionId, resp.QueryResult_, resp.IgnoreTimeStamp != nil && *resp.IgnoreTimeStamp, nil, moreData, s.config.FetchSize, s.config.TimeZone, s.timeFactor, resp.GetColumnIndex2TsBlockColumnIndexList())
 }
 
 func (s *Session) genInsertTabletsReq(tablets []*Tablet, isAligned bool) (*rpc.TSInsertTabletsReq, error) {
@@ -809,7 +1058,7 @@ func (s *Session) genInsertTabletsReq(tablets []*Tablet, isAligned bool) (*rpc.T
 		sizeList         = make([]int32, length)
 	)
 	for index, tablet := range tablets {
-		deviceIds[index] = tablet.deviceId
+		deviceIds[index] = tablet.insertTargetName
 		measurementsList[index] = tablet.GetMeasurements()
 
 		values, err := tablet.getValuesBytes()
@@ -820,7 +1069,7 @@ func (s *Session) genInsertTabletsReq(tablets []*Tablet, isAligned bool) (*rpc.T
 		valuesList[index] = values
 		timestampsList[index] = tablet.GetTimestampBytes()
 		typesList[index] = tablet.getDataTypes()
-		sizeList[index] = int32(tablet.rowCount)
+		sizeList[index] = int32(tablet.RowSize)
 	}
 	request := rpc.TSInsertTabletsReq{
 		SessionId:        s.sessionId,
@@ -836,7 +1085,8 @@ func (s *Session) genInsertTabletsReq(tablets []*Tablet, isAligned bool) (*rpc.T
 }
 
 func (s *Session) genInsertRecordsReq(deviceIds []string, measurements [][]string, dataTypes [][]TSDataType, values [][]interface{},
-	timestamps []int64, isAligned bool) (*rpc.TSInsertRecordsReq, error) {
+	timestamps []int64, isAligned bool,
+) (*rpc.TSInsertRecordsReq, error) {
 	length := len(deviceIds)
 	if length != len(timestamps) || length != len(measurements) || length != len(values) {
 		return nil, errLength
@@ -850,7 +1100,7 @@ func (s *Session) genInsertRecordsReq(deviceIds []string, measurements [][]strin
 	}
 	v := make([][]byte, length)
 	for i := 0; i < len(measurements); i++ {
-		if bys, err := valuesToBytes(dataTypes[i], values[i]); err == nil {
+		if bys, err := valuesToBytes(dataTypes[i], values[i], measurements[i]); err == nil {
 			v[i] = bys
 		} else {
 			return nil, err
@@ -860,7 +1110,7 @@ func (s *Session) genInsertRecordsReq(deviceIds []string, measurements [][]strin
 	return &request, nil
 }
 
-func valuesToBytes(dataTypes []TSDataType, values []interface{}) ([]byte, error) {
+func valuesToBytes(dataTypes []TSDataType, values []interface{}, measurementNames []string) ([]byte, error) {
 	buff := &bytes.Buffer{}
 	for i, t := range dataTypes {
 		binary.Write(buff, binary.BigEndian, byte(t))
@@ -875,64 +1125,87 @@ func valuesToBytes(dataTypes []TSDataType, values []interface{}) ([]byte, error)
 			case bool:
 				binary.Write(buff, binary.BigEndian, v)
 			default:
-				return nil, fmt.Errorf("values[%d] %v(%v) must be bool", i, v, reflect.TypeOf(v))
+				return nil, fmt.Errorf("measurement %s values[%d] %v(%v) must be bool", measurementNames[i], i, v, reflect.TypeOf(v))
 			}
 		case INT32:
 			switch v.(type) {
 			case int32:
 				binary.Write(buff, binary.BigEndian, v)
 			default:
-				return nil, fmt.Errorf("values[%d] %v(%v) must be int32", i, v, reflect.TypeOf(v))
+				return nil, fmt.Errorf("measurement %s values[%d] %v(%v) must be int32", measurementNames[i], i, v, reflect.TypeOf(v))
 			}
-		case INT64:
+		case INT64, TIMESTAMP:
 			switch v.(type) {
 			case int64:
 				binary.Write(buff, binary.BigEndian, v)
 			default:
-				return nil, fmt.Errorf("values[%d] %v(%v) must be int64", i, v, reflect.TypeOf(v))
+				return nil, fmt.Errorf("measurement %s values[%d] %v(%v) must be int64", measurementNames[i], i, v, reflect.TypeOf(v))
 			}
 		case FLOAT:
 			switch v.(type) {
 			case float32:
 				binary.Write(buff, binary.BigEndian, v)
 			default:
-				return nil, fmt.Errorf("values[%d] %v(%v) must be float32", i, v, reflect.TypeOf(v))
+				return nil, fmt.Errorf("measurement %s values[%d] %v(%v) must be float32", measurementNames[i], i, v, reflect.TypeOf(v))
 			}
 		case DOUBLE:
 			switch v.(type) {
 			case float64:
 				binary.Write(buff, binary.BigEndian, v)
 			default:
-				return nil, fmt.Errorf("values[%d] %v(%v) must be float64", i, v, reflect.TypeOf(v))
+				return nil, fmt.Errorf("measurement %s values[%d] %v(%v) must be float64", measurementNames[i], i, v, reflect.TypeOf(v))
 			}
-		case TEXT:
+		case TEXT, STRING:
 			switch s := v.(type) {
 			case string:
 				size := len(s)
 				binary.Write(buff, binary.BigEndian, int32(size))
 				binary.Write(buff, binary.BigEndian, []byte(s))
+			case []byte:
+				size := len(s)
+				binary.Write(buff, binary.BigEndian, int32(size))
+				binary.Write(buff, binary.BigEndian, s)
 			default:
-				return nil, fmt.Errorf("values[%d] %v(%v) must be string", i, v, reflect.TypeOf(v))
+				return nil, fmt.Errorf("measurement %s values[%d] %v(%v) must be string or []byte", measurementNames[i], i, v, reflect.TypeOf(v))
+			}
+		case BLOB:
+			switch s := v.(type) {
+			case []byte:
+				size := len(s)
+				binary.Write(buff, binary.BigEndian, int32(size))
+				binary.Write(buff, binary.BigEndian, s)
+			default:
+				return nil, fmt.Errorf("measurement %s values[%d] %v(%v) must be []byte", measurementNames[i], i, v, reflect.TypeOf(v))
+			}
+		case DATE:
+			switch s := v.(type) {
+			case time.Time:
+				date, err := DateToInt32(s)
+				if err != nil {
+					return nil, err
+				}
+				binary.Write(buff, binary.BigEndian, date)
+			default:
+				return nil, fmt.Errorf("measurement %s values[%d] %v(%v) must be time.Time", measurementNames[i], i, v, reflect.TypeOf(v))
 			}
 		default:
-			return nil, fmt.Errorf("types[%d] is incorrect, it must in (BOOLEAN, INT32, INT64, FLOAT, DOUBLE, TEXT)", i)
+			return nil, fmt.Errorf("measurement %s types[%d] is incorrect, it must in (BOOLEAN, INT32, INT64, FLOAT, DOUBLE, TEXT, TIMESTAMP, BLOB, DATE, STRING)", measurementNames[i], i)
 		}
 	}
 	return buff.Bytes(), nil
 }
 
-func (s *Session) InsertTablet(tablet *Tablet, sorted bool) (r *rpc.TSStatus, err error) {
-	if !sorted {
-		if err := tablet.Sort(); err != nil {
-			return nil, err
-		}
+func (s *Session) insertRelationalTablet(tablet *Tablet) error {
+	if tablet.Len() == 0 {
+		return nil
 	}
-	request, err := s.genTSInsertTabletReq(tablet, false)
+	request, err := s.genTSInsertTabletReq(tablet, true, true)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	request.ColumnCategories = tablet.getColumnCategories()
 
-	r, err = s.client.InsertTablet(context.Background(), request)
+	r, err := s.client.InsertTablet(context.Background(), request)
 
 	if err != nil && r == nil {
 		if s.reconnect() {
@@ -941,21 +1214,24 @@ func (s *Session) InsertTablet(tablet *Tablet, sorted bool) (r *rpc.TSStatus, er
 		}
 	}
 
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
-func (s *Session) InsertAlignedTablet(tablet *Tablet, sorted bool) (r *rpc.TSStatus, err error) {
+func (s *Session) InsertTablet(tablet *Tablet, sorted bool) error {
 	if !sorted {
 		if err := tablet.Sort(); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	request, err := s.genTSInsertTabletReq(tablet, true)
+	request, err := s.genTSInsertTabletReq(tablet, false, false)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	r, err = s.client.InsertTablet(context.Background(), request)
+	r, err := s.client.InsertTablet(context.Background(), request)
 
 	if err != nil && r == nil {
 		if s.reconnect() {
@@ -964,20 +1240,50 @@ func (s *Session) InsertAlignedTablet(tablet *Tablet, sorted bool) (r *rpc.TSSta
 		}
 	}
 
-	return r, err
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
 }
 
-func (s *Session) genTSInsertTabletReq(tablet *Tablet, isAligned bool) (*rpc.TSInsertTabletReq, error) {
+func (s *Session) InsertAlignedTablet(tablet *Tablet, sorted bool) error {
+	if !sorted {
+		if err := tablet.Sort(); err != nil {
+			return err
+		}
+	}
+	request, err := s.genTSInsertTabletReq(tablet, true, false)
+	if err != nil {
+		return err
+	}
+
+	r, err := s.client.InsertTablet(context.Background(), request)
+
+	if err != nil && r == nil {
+		if s.reconnect() {
+			request.SessionId = s.sessionId
+			r, err = s.client.InsertTablet(context.Background(), request)
+		}
+	}
+
+	if err != nil {
+		return err
+	}
+	return VerifySuccess(r)
+}
+
+func (s *Session) genTSInsertTabletReq(tablet *Tablet, isAligned bool, writeToTable bool) (*rpc.TSInsertTabletReq, error) {
 	if values, err := tablet.getValuesBytes(); err == nil {
 		request := &rpc.TSInsertTabletReq{
 			SessionId:    s.sessionId,
-			PrefixPath:   tablet.deviceId,
+			PrefixPath:   tablet.insertTargetName,
 			Measurements: tablet.GetMeasurements(),
 			Values:       values,
 			Timestamps:   tablet.GetTimestampBytes(),
 			Types:        tablet.getDataTypes(),
-			Size:         int32(tablet.rowCount),
+			Size:         int32(tablet.RowSize),
 			IsAligned:    &isAligned,
+			WriteToTable: &writeToTable,
 		}
 		return request, nil
 	} else {
@@ -990,46 +1296,59 @@ func (s *Session) GetSessionId() int64 {
 }
 
 func NewSession(config *Config) Session {
-	endPoint := endPoint{}
-	endPoint.Host = config.Host
-	endPoint.Port = config.Port
-	endPointList.PushBack(endPoint)
-	return Session{config: config}
+	config.sqlDialect = TreeSqlDialect
+	return newSessionWithSpecifiedSqlDialect(config)
 }
 
-func NewClusterSession(ClusterConfig *ClusterConfig) Session {
+func newSessionWithSpecifiedSqlDialect(config *Config) Session {
+	endPointList := []endPoint{{
+		Host: config.Host,
+		Port: config.Port,
+	}}
+	return Session{
+		config:       config,
+		endPointList: endPointList,
+	}
+}
+
+func NewClusterSession(clusterConfig *ClusterConfig) (Session, error) {
+	clusterConfig.sqlDialect = TreeSqlDialect
+	return newClusterSessionWithSqlDialect(clusterConfig)
+}
+
+func newClusterSessionWithSqlDialect(clusterConfig *ClusterConfig) (Session, error) {
 	session := Session{}
-	node := endPoint{}
-	for i := 0; i < len(ClusterConfig.NodeUrls); i++ {
-		node.Host = strings.Split(ClusterConfig.NodeUrls[i], ":")[0]
-		node.Port = strings.Split(ClusterConfig.NodeUrls[i], ":")[1]
-		endPointList.PushBack(node)
+	session.endPointList = make([]endPoint, len(clusterConfig.NodeUrls))
+	for i := 0; i < len(clusterConfig.NodeUrls); i++ {
+		node := endPoint{}
+		node.Host = strings.Split(clusterConfig.NodeUrls[i], ":")[0]
+		node.Port = strings.Split(clusterConfig.NodeUrls[i], ":")[1]
+		session.endPointList[i] = node
 	}
 	var err error
-	for e := endPointList.Front(); e != nil; e = e.Next() {
-		session.trans = thrift.NewTSocketConf(net.JoinHostPort(e.Value.(endPoint).Host, e.Value.(endPoint).Port), &thrift.TConfiguration{
+	for i := range session.endPointList {
+		ep := session.endPointList[i]
+		session.trans = thrift.NewTSocketConf(net.JoinHostPort(ep.Host, ep.Port), &thrift.TConfiguration{
 			ConnectTimeout: time.Duration(0), // Use 0 for no timeout
 		})
-		if err == nil {
-			// session.trans = thrift.NewTFramedTransport(session.trans)	// deprecated
-			var tmp_conf = thrift.TConfiguration{MaxFrameSize: thrift.DEFAULT_MAX_FRAME_SIZE}
-			session.trans = thrift.NewTFramedTransportConf(session.trans, &tmp_conf)
-			if !session.trans.IsOpen() {
-				err = session.trans.Open()
-				if err != nil {
-					log.Println(err)
-				} else {
-					session.config = getConfig(e.Value.(endPoint).Host, e.Value.(endPoint).Port,
-						ClusterConfig.UserName, ClusterConfig.Password, ClusterConfig.FetchSize, ClusterConfig.TimeZone)
-					break
-				}
+		// session.trans = thrift.NewTFramedTransport(session.trans)	// deprecated
+		tmp_conf := thrift.TConfiguration{MaxFrameSize: thrift.DEFAULT_MAX_FRAME_SIZE}
+		session.trans = thrift.NewTFramedTransportConf(session.trans, &tmp_conf)
+		if !session.trans.IsOpen() {
+			err = session.trans.Open()
+			if err != nil {
+				log.Println(err)
+			} else {
+				session.config = getConfig(ep.Host, ep.Port,
+					clusterConfig.UserName, clusterConfig.Password, clusterConfig.FetchSize, clusterConfig.TimeZone, clusterConfig.ConnectRetryMax, clusterConfig.Database, clusterConfig.sqlDialect)
+				break
 			}
 		}
 	}
-	if err != nil {
-		log.Fatal("No Server Can Connect")
+	if !session.trans.IsOpen() {
+		return session, fmt.Errorf("no server can connect")
 	}
-	return session
+	return session, nil
 }
 
 func (s *Session) initClusterConn(node endPoint) error {
@@ -1040,7 +1359,7 @@ func (s *Session) initClusterConn(node endPoint) error {
 	})
 	if err == nil {
 		// s.trans = thrift.NewTFramedTransport(s.trans)	// deprecated
-		var tmp_conf = thrift.TConfiguration{MaxFrameSize: thrift.DEFAULT_MAX_FRAME_SIZE}
+		tmp_conf := thrift.TConfiguration{MaxFrameSize: thrift.DEFAULT_MAX_FRAME_SIZE}
 		s.trans = thrift.NewTFramedTransportConf(s.trans, &tmp_conf)
 		if !s.trans.IsOpen() {
 			err = s.trans.Open()
@@ -1059,16 +1378,16 @@ func (s *Session) initClusterConn(node endPoint) error {
 	}
 
 	if s.config.ConnectRetryMax < 1 {
-		s.config.ConnectRetryMax = DefualtConnectRetryMax
+		s.config.ConnectRetryMax = DefaultConnectRetryMax
 	}
 
-	var protocolFactory thrift.TProtocolFactory
-	protocolFactory = thrift.NewTBinaryProtocolFactoryDefault()
-	iprot := protocolFactory.GetProtocol(s.trans)
-	oprot := protocolFactory.GetProtocol(s.trans)
-	s.client = rpc.NewTSIServiceClient(thrift.NewTStandardClient(iprot, oprot))
-	req := rpc.TSOpenSessionReq{ClientProtocol: rpc.TSProtocolVersion_IOTDB_SERVICE_PROTOCOL_V3, ZoneId: s.config.TimeZone, Username: &s.config.UserName,
-		Password: &s.config.Password}
+	iprot := s.protocolFactory.GetProtocol(s.trans)
+	oprot := s.protocolFactory.GetProtocol(s.trans)
+	s.client = rpc.NewIClientRPCServiceClient(thrift.NewTStandardClient(iprot, oprot))
+	req := rpc.TSOpenSessionReq{
+		ClientProtocol: rpc.TSProtocolVersion_IOTDB_SERVICE_PROTOCOL_V3, ZoneId: s.config.TimeZone, Username: s.config.UserName,
+		Password: &s.config.Password,
+	}
 
 	resp, err := s.client.OpenSession(context.Background(), &req)
 	if err != nil {
@@ -1077,32 +1396,35 @@ func (s *Session) initClusterConn(node endPoint) error {
 	s.sessionId = resp.GetSessionId()
 	s.requestStatementId, err = s.client.RequestStatementId(context.Background(), s.sessionId)
 	return err
-
 }
 
-func getConfig(host string, port string, userName string, passWord string, fetchSize int32, timeZone string) *Config {
+func getConfig(host string, port string, userName string, passWord string, fetchSize int32, timeZone string, connectRetryMax int, database string, sqlDialect string) *Config {
 	return &Config{
-		Host:      host,
-		Port:      port,
-		UserName:  userName,
-		Password:  passWord,
-		FetchSize: fetchSize,
-		TimeZone:  timeZone,
+		Host:            host,
+		Port:            port,
+		UserName:        userName,
+		Password:        passWord,
+		FetchSize:       fetchSize,
+		TimeZone:        timeZone,
+		ConnectRetryMax: connectRetryMax,
+		sqlDialect:      sqlDialect,
+		Database:        database,
 	}
 }
 
 func (s *Session) reconnect() bool {
 	var err error
-	var connectedSuccess = false
+	connectedSuccess := false
 
 	for i := 0; i < s.config.ConnectRetryMax; i++ {
-		for e := endPointList.Front(); e != nil; e = e.Next() {
-			err = s.initClusterConn(e.Value.(endPoint))
+		for i := range s.endPointList {
+			ep := s.endPointList[i]
+			err = s.initClusterConn(ep)
 			if err == nil {
 				connectedSuccess = true
 				break
 			} else {
-				log.Println("Connection refused:", e.Value.(endPoint))
+				log.Println("Connection refused:", ep)
 			}
 		}
 		if connectedSuccess {
@@ -1110,4 +1432,8 @@ func (s *Session) reconnect() bool {
 		}
 	}
 	return connectedSuccess
+}
+
+func (s *Session) SetFetchSize(fetchSize int32) {
+	s.config.FetchSize = fetchSize
 }
